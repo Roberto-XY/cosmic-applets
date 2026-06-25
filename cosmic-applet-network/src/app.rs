@@ -168,20 +168,22 @@ pub enum ActiveConnectionInfo {
         hw_address: String,
         speed: u32,
         ip4_address: Option<String>,
-        ip6_address: Option<String>,
     },
     WiFi {
         name: String,
         ip4_address: Option<String>,
-        ip6_address: Option<String>,
         state: ActiveConnectionState,
         strength: u8,
         hw_address: String,
     },
     Vpn {
         name: String,
+        /// The connection profile UUID. Profile ids need not be unique, so
+        /// matching against saved profiles or pending operations must use
+        /// this, never `name`.
+        uuid: Uuid,
         ip4_address: Option<String>,
-        ip6_address: Option<String>,
+        state: ActiveConnectionState,
     },
 }
 
@@ -274,6 +276,10 @@ pub struct RequestedVpn {
 pub struct PendingVpn {
     uuid: Arc<str>,
     action: PendingVpnAction,
+    /// The `vpn_request_generation` this request was issued under. Timeout
+    /// and completion messages carry the same value, so a stale message from
+    /// an earlier request can't clear a newer request's pending state.
+    generation: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -281,6 +287,14 @@ pub enum PendingVpnAction {
     Activate,
     Deactivate,
 }
+
+/// Applet-side bound on a pending activation. nmrs already bounds the
+/// post-request wait at 30s, so this only guards against the preceding
+/// D-Bus calls hanging (e.g. NetworkManager restarting).
+const VPN_ACTIVATE_PENDING_BOUND: std::time::Duration = std::time::Duration::from_secs(45);
+/// Applet-side bound on a pending deactivation. `disconnect_vpn_by_uuid`
+/// resolves at request time, so this covers the actual teardown.
+const VPN_DEACTIVATE_PENDING_BOUND: std::time::Duration = std::time::Duration::from_secs(15);
 
 #[derive(Clone, Debug)]
 pub enum ConnectionSettings {
@@ -329,6 +343,14 @@ struct CosmicNetworkApplet {
 
     /// When defined, displays connections for the specific device.
     active_device: Option<Arc<DeviceInfo>>,
+
+    /// Monotonic id handed to each VPN activate/deactivate request; see
+    /// [`PendingVpn::generation`].
+    vpn_request_generation: u64,
+    /// Coalesces snapshot refreshes: at most one snapshot task runs at a
+    /// time, with at most one rerun queued behind it.
+    snapshot_in_flight: bool,
+    snapshot_rerequested: bool,
 }
 
 fn wifi_icon(strength: u8) -> &'static str {
@@ -343,6 +365,104 @@ fn wifi_icon(strength: u8) -> &'static str {
     }
 }
 
+/// One caption line showing the IPv4 address, or an empty caption that
+/// still reserves the line's height, so sibling rows keep a uniform two-line
+/// size and the popup doesn't reflow as connection state changes.
+fn ipv4_line<'a>(ip4_address: Option<&str>) -> Element<'a, Message> {
+    let Some(addr) = ip4_address else {
+        return text::caption("").into();
+    };
+    // Strip the subnet mask (e.g. "10.0.0.2/24" -> "10.0.0.2"); the drop-down
+    // only needs the address itself for glancing at the host on a local network.
+    let addr = addr.split('/').next().unwrap_or(addr);
+    text::caption(format!("{}: {}", fl!("ipv4"), addr)).into()
+}
+
+/// Whether the popup has any VPN rows to show: saved profiles, or an active
+/// VPN without a matching profile (activated externally, or seen before the
+/// saved connections finish loading).
+fn has_vpn_rows(nm_state: &MyNetworkState) -> bool {
+    !nm_state.known_vpns.is_empty()
+        || nm_state
+            .nm_state
+            .active_conns
+            .iter()
+            .any(|conn| matches!(conn, ActiveConnectionInfo::Vpn { .. }))
+}
+
+/// Best-state summary of the active connections matching a VPN profile UUID.
+/// NM can briefly list several connections for one profile during a quick
+/// reconnect, so prefer the most-alive entry over whichever is listed first.
+fn active_vpn_status<'a>(
+    active_conns: &'a [ActiveConnectionInfo],
+    uuid: &str,
+) -> Option<(ActiveConnectionState, Option<&'a str>)> {
+    fn rank(state: ActiveConnectionState) -> u8 {
+        match state {
+            ActiveConnectionState::Activated => 2,
+            ActiveConnectionState::Activating | ActiveConnectionState::Deactivating => 1,
+            _ => 0,
+        }
+    }
+    let mut best: Option<(ActiveConnectionState, Option<&'a str>)> = None;
+    for conn in active_conns {
+        let ActiveConnectionInfo::Vpn {
+            uuid: conn_uuid,
+            ip4_address,
+            state,
+            ..
+        } = conn
+        else {
+            continue;
+        };
+        if conn_uuid.as_ref() != uuid {
+            continue;
+        }
+        if best.is_none_or(|(b, _)| rank(*state) > rank(b)) {
+            best = Some((*state, ip4_address.as_deref()));
+        }
+    }
+    best
+}
+
+/// One list row for a VPN: icon, name over the IPv4 caption line, and a
+/// trailing spinner (busy) or "connected" label.
+fn vpn_row<'a>(
+    name: &'a str,
+    ip4_address: Option<&'a str>,
+    busy: bool,
+    activated: bool,
+    on_press: Option<Message>,
+) -> Element<'a, Message> {
+    let mut content: Vec<Element<'a, Message>> = vec![
+        icon::from_name("network-vpn-symbolic")
+            .size(24)
+            .symbolic(true)
+            .into(),
+        column::with_children([text::body(name).into(), ipv4_line(ip4_address)])
+            .width(Length::Fill)
+            .into(),
+    ];
+    if busy {
+        content.push(indeterminate_circular().size(24.0).into());
+    } else if activated {
+        content.push(
+            text::body(fl!("connected"))
+                .align_y(Alignment::Center)
+                .into(),
+        );
+    }
+    let mut btn = menu_button(
+        row::with_children(content)
+            .align_y(Alignment::Center)
+            .spacing(8),
+    );
+    if let Some(message) = on_press {
+        btn = btn.on_press(message);
+    }
+    btn.into()
+}
+
 fn vpn_section<'a>(
     nm_state: &'a MyNetworkState,
     show_available_vpns: bool,
@@ -351,7 +471,7 @@ fn vpn_section<'a>(
 ) -> cosmic::iced::widget::Column<'a, Message, cosmic::Theme> {
     let mut vpn_col = cosmic::widget::column::with_capacity::<'_, Message, cosmic::Theme, _>(4);
 
-    if !nm_state.known_vpns.is_empty() {
+    if has_vpn_rows(nm_state) {
         let dropdown_icon = if show_available_vpns {
             "go-up-symbolic"
         } else {
@@ -404,87 +524,154 @@ fn vpn_section<'a>(
             vpn_col = vpn_col.push(col);
         }
 
-        let vpn_toggle_btn = menu_button(row::with_children([
-            Element::from(
-                text::body(fl!("vpn-connections"))
-                    .width(Length::Fill)
-                    .height(Length::Fixed(24.0))
-                    .align_y(Alignment::Center),
-            ),
+        let mut toggle_content = vec![Element::from(
+            text::body(fl!("vpn-connections"))
+                .width(Length::Fill)
+                .height(Length::Fixed(24.0))
+                .align_y(Alignment::Center),
+        )];
+        // While collapsed, indicate VPN state on the toggle row itself.
+        if !show_available_vpns {
+            if nm_state.pending_vpn.is_some()
+                || nm_state.nm_state.active_conns.iter().any(|c| {
+                    matches!(
+                        c,
+                        ActiveConnectionInfo::Vpn {
+                            state: ActiveConnectionState::Activating
+                                | ActiveConnectionState::Deactivating,
+                            ..
+                        }
+                    )
+                })
+            {
+                toggle_content.push(indeterminate_circular().size(24.0).into());
+            } else {
+                let mut activated_names =
+                    nm_state
+                        .nm_state
+                        .active_conns
+                        .iter()
+                        .filter_map(|c| match c {
+                            ActiveConnectionInfo::Vpn {
+                                name,
+                                state: ActiveConnectionState::Activated,
+                                ..
+                            } => Some(name.as_str()),
+                            _ => None,
+                        });
+                if let Some(name) = activated_names.next() {
+                    // Name the connected VPN so it stays identifiable while
+                    // the list is collapsed; fall back to the generic label
+                    // when several are up at once.
+                    let label = if activated_names.next().is_none() {
+                        name.to_string()
+                    } else {
+                        fl!("connected")
+                    };
+                    toggle_content.push(
+                        text::body(label)
+                            .height(Length::Fixed(24.0))
+                            .align_y(Alignment::Center)
+                            .into(),
+                    );
+                }
+            }
+        }
+        toggle_content.push(
             container(icon::from_name(dropdown_icon).size(16).symbolic(true))
                 .center(Length::Fixed(24.0))
                 .into(),
-        ]))
-        .on_press(Message::ToggleVpnList);
+        );
+        let vpn_toggle_btn = menu_button(row::with_children(toggle_content).spacing(8))
+            .on_press(Message::ToggleVpnList);
 
         vpn_col = vpn_col.push(vpn_toggle_btn);
 
         if show_available_vpns {
+            let mut vpn_list = Vec::with_capacity(nm_state.known_vpns.len());
             for (uuid, connection) in &nm_state.known_vpns {
                 let id = match connection {
                     ConnectionSettings::Vpn { id } | ConnectionSettings::Wireguard { id } => {
                         id.as_str()
                     }
                 };
-                // Check if this VPN is currently active
-                let is_active = nm_state.nm_state.active_conns.iter().any(
-                    |conn| matches!(conn, ActiveConnectionInfo::Vpn { name, .. } if name == id),
-                );
                 let pending_action = nm_state
                     .pending_vpn
                     .as_ref()
                     .filter(|pending| pending.uuid.as_ref() == uuid.as_ref())
                     .map(|pending| pending.action);
 
-                let mut btn_content = vec![
-                    icon::from_name("network-vpn-symbolic")
-                        .size(24)
-                        .symbolic(true)
-                        .into(),
-                    text::body(id).width(Length::Fill).into(),
-                ];
-
-                if is_active {
-                    btn_content.push(text::body(fl!("connected")).align_x(Alignment::End).into());
-                }
-                if pending_action.is_some() {
-                    btn_content.push(indeterminate_circular().size(24.0).into());
-                }
-
-                let mut btn = menu_button(
-                    row::with_children(btn_content)
-                        .align_y(Alignment::Center)
-                        .spacing(8),
+                let status = active_vpn_status(&nm_state.nm_state.active_conns, uuid.as_ref());
+                let transitioning = matches!(
+                    status,
+                    Some((
+                        ActiveConnectionState::Activating | ActiveConnectionState::Deactivating,
+                        _
+                    ))
                 );
-
-                btn = if pending_action.is_some() {
-                    btn
-                } else if is_active {
-                    btn.on_press(Message::DeactivateVpn(uuid.clone()))
+                let activated = matches!(status, Some((ActiveConnectionState::Activated, _)));
+                let busy = pending_action.is_some() || transitioning;
+                // Any still-listed connection gets Deactivate — even in odd
+                // states like Unknown — so a lingering connection can always
+                // be torn down; only a fully absent one gets Activate.
+                let on_press = if busy {
+                    None
+                } else if status.is_some() {
+                    Some(Message::DeactivateVpn(uuid.clone()))
                 } else {
-                    btn.on_press(Message::ActivateVpn(uuid.clone()))
+                    Some(Message::ActivateVpn(uuid.clone()))
                 };
-
-                vpn_col = vpn_col.push(btn);
+                vpn_list.push(vpn_row(
+                    id,
+                    status.and_then(|(_, ip4)| ip4),
+                    busy,
+                    activated,
+                    on_press,
+                ));
             }
+            // Active VPNs without a matching saved profile (activated
+            // externally, or seen before the profiles finish loading) are
+            // still listed, and can be torn down via their connection UUID.
+            for conn in &nm_state.nm_state.active_conns {
+                let ActiveConnectionInfo::Vpn {
+                    name,
+                    uuid,
+                    ip4_address,
+                    state,
+                } = conn
+                else {
+                    continue;
+                };
+                if nm_state.known_vpns.contains_key(uuid.as_ref()) {
+                    continue;
+                }
+                let pending = nm_state
+                    .pending_vpn
+                    .as_ref()
+                    .is_some_and(|pending| pending.uuid.as_ref() == uuid.as_ref());
+                let busy = pending
+                    || matches!(
+                        state,
+                        ActiveConnectionState::Activating | ActiveConnectionState::Deactivating
+                    );
+                let activated = matches!(state, ActiveConnectionState::Activated);
+                let on_press = (!busy).then(|| Message::DeactivateVpn(uuid.clone()));
+                vpn_list.push(vpn_row(
+                    name,
+                    ip4_address.as_deref(),
+                    busy,
+                    activated,
+                    on_press,
+                ));
+            }
+            vpn_col = vpn_col.push(
+                container(scrollable::<'_, Message>(column::with_children(vpn_list)))
+                    .max_height(300.0),
+            );
         }
     }
 
     vpn_col
-}
-
-fn ip_address_elements<'a>(
-    ip4_address: &Option<String>,
-    _ip6_address: &Option<String>,
-) -> Vec<Element<'a, Message>> {
-    let mut elements = Vec::with_capacity(1);
-    if let Some(addr) = ip4_address {
-        // Strip the subnet mask (e.g. "10.0.0.2/24" -> "10.0.0.2"); the drop-down
-        // only needs the address itself for glancing at the host on a local network.
-        let addr = addr.split('/').next().unwrap_or(addr.as_str());
-        elements.push(text(format!("{}: {}", fl!("ipv4"), addr)).size(12).into());
-    }
-    elements
 }
 
 fn network_type(security: nmrs::SecurityFeatures) -> NetworkType {
@@ -559,13 +746,31 @@ fn snapshot_task() -> Task<Message> {
     cosmic::task::future(async move {
         let nm = match NmrsManager::new().await {
             Ok(nm) => nm,
-            Err(e) => return Message::Error(format!("nmrs init: {e}")),
+            Err(e) => return Message::SnapshotFailed(format!("nmrs init: {e}")),
         };
 
-        match nm.snapshot().await {
-            Ok(snapshot) => Message::Snapshot(snapshot_to_applet(snapshot)),
-            Err(e) => Message::Error(format!("snapshot: {e}")),
+        // Snapshots race NetworkManager device churn (e.g. VPN tun devices
+        // appearing/disappearing), which makes the whole snapshot fail with a
+        // transient "Object does not exist" error. Retry only that error;
+        // anything else is reported immediately.
+        let mut last_err = None;
+        for attempt in 0..3 {
+            if attempt > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            }
+            match nm.snapshot().await {
+                Ok(snapshot) => return Message::Snapshot(snapshot_to_applet(snapshot)),
+                Err(e) => {
+                    let msg = e.to_string();
+                    if !msg.contains("Object does not exist") && !msg.contains("UnknownObject") {
+                        return Message::SnapshotFailed(format!("snapshot: {e}"));
+                    }
+                    tracing::debug!("snapshot attempt {attempt} failed: {e}");
+                    last_err = Some(e);
+                }
+            }
         }
+        Message::SnapshotFailed(format!("snapshot: {}", last_err.unwrap()))
     })
 }
 
@@ -607,8 +812,10 @@ fn network_events_task() -> Task<Message> {
 
 fn snapshot_to_applet(snapshot: NetworkSnapshot) -> AppletSnapshot {
     let summary = snapshot.applet_summary();
+    let mut saved_vpns: Vec<_> = summary.saved_vpns.values().collect();
+    saved_vpns.sort_by_cached_key(|vpn| (vpn.id.to_lowercase(), vpn.uuid.clone()));
     let mut known_vpns = IndexMap::new();
-    for vpn in summary.saved_vpns.values() {
+    for vpn in saved_vpns {
         let uuid: Uuid = Arc::from(vpn.uuid.as_str());
         let entry = match vpn.kind {
             Some(nmrs::VpnKind::WireGuard) => ConnectionSettings::Wireguard { id: vpn.id.clone() },
@@ -636,35 +843,31 @@ fn snapshot_to_applet(snapshot: NetworkSnapshot) -> AppletSnapshot {
                 hw_address: wired.hw_address.clone().unwrap_or_default(),
                 speed: wired.speed_mbps.unwrap_or_default(),
                 ip4_address: wired.ip4_address.clone(),
-                ip6_address: wired.ip6_address.clone(),
             }),
-            ActiveConnection::Wifi(wifi)
-                if known_vpns.values().any(|connection| {
-                    matches!(
-                        connection,
-                        ConnectionSettings::Vpn { id } | ConnectionSettings::Wireguard { id }
-                            if id == &wifi.ssid
-                    )
-                }) =>
-            {
+            // VPNs riding a Wi-Fi device are classified as Wifi by nmrs;
+            // normalize the ones whose profile is a saved VPN. Matching by
+            // UUID (not id/ssid) keeps a genuine Wi-Fi network whose SSID
+            // coincides with a VPN profile name from being misclassified.
+            ActiveConnection::Wifi(wifi) if known_vpns.contains_key(wifi.uuid.as_str()) => {
                 Some(ActiveConnectionInfo::Vpn {
                     name: wifi.ssid.clone(),
+                    uuid: Arc::from(wifi.uuid.as_str()),
                     ip4_address: wifi.ip4_address.clone(),
-                    ip6_address: wifi.ip6_address.clone(),
+                    state: wifi.state,
                 })
             }
             ActiveConnection::Wifi(wifi) => Some(ActiveConnectionInfo::WiFi {
                 name: wifi.ssid.clone(),
                 ip4_address: wifi.ip4_address.clone(),
-                ip6_address: wifi.ip6_address.clone(),
                 state: wifi.state,
                 strength: wifi.strength.unwrap_or_default(),
                 hw_address: wifi.bssid.clone().unwrap_or_default(),
             }),
             ActiveConnection::Vpn(vpn) => Some(ActiveConnectionInfo::Vpn {
                 name: vpn.id.clone(),
+                uuid: Arc::from(vpn.uuid.as_str()),
                 ip4_address: vpn.ip4_address.clone(),
-                ip6_address: vpn.ip6_address.clone(),
+                state: vpn.state,
             }),
             ActiveConnection::Other(_) | _ => None,
         })
@@ -784,23 +987,14 @@ impl CosmicNetworkApplet {
         let Some(pending) = self.nm_state.pending_vpn.as_ref() else {
             return;
         };
-        let Some(connection) = self.nm_state.known_vpns.get(&pending.uuid) else {
-            self.nm_state.pending_vpn = None;
-            self.update_icon_name();
-            return;
-        };
-        let id = match connection {
-            ConnectionSettings::Vpn { id } | ConnectionSettings::Wireguard { id } => id,
-        };
-        let is_active = self
-            .nm_state
-            .nm_state
-            .active_conns
-            .iter()
-            .any(|conn| matches!(conn, ActiveConnectionInfo::Vpn { name, .. } if name == id));
+        // NM lists a VPN under active connections as soon as activation
+        // starts; only `Activated` means the tunnel is actually up.
+        let status = active_vpn_status(&self.nm_state.nm_state.active_conns, &pending.uuid);
         let completed = match pending.action {
-            PendingVpnAction::Activate => is_active,
-            PendingVpnAction::Deactivate => !is_active,
+            PendingVpnAction::Activate => {
+                matches!(status, Some((ActiveConnectionState::Activated, _)))
+            }
+            PendingVpnAction::Deactivate => status.is_none(),
         };
         if completed {
             self.nm_state.pending_vpn = None;
@@ -849,12 +1043,15 @@ impl CosmicNetworkApplet {
             .pending_vpn
             .as_ref()
             .is_some_and(|pending| pending.action == PendingVpnAction::Activate)
-            || self
-                .nm_state
-                .nm_state
-                .active_conns
-                .iter()
-                .any(|conn| matches!(conn, ActiveConnectionInfo::Vpn { .. }))
+            || self.nm_state.nm_state.active_conns.iter().any(|conn| {
+                matches!(
+                    conn,
+                    ActiveConnectionInfo::Vpn {
+                        state: ActiveConnectionState::Activating | ActiveConnectionState::Activated,
+                        ..
+                    }
+                )
+            })
         {
             self.icon_name = "network-vpn-symbolic".to_string();
             return;
@@ -907,7 +1104,11 @@ impl CosmicNetworkApplet {
             .into()
     }
 
+    /// Activate a VPN. `connect_vpn_by_uuid` resolves once activation
+    /// completes, fails, or times out, so the resulting
+    /// [`Message::VpnOperationFinished`] marks the exact end of the pending state.
     fn connect_vpn(&mut self, uuid: Arc<str>) -> Task<cosmic::Action<Message>> {
+        let generation = self.vpn_request_generation;
         cosmic::task::future(async move {
             let error = match NmrsManager::new().await {
                 Ok(nm) => nm
@@ -918,13 +1119,48 @@ impl CosmicNetworkApplet {
                 Err(e) => Some(format!("nmrs init: {e}")),
             };
             Message::VpnOperationFinished {
-                uuid,
                 action: PendingVpnAction::Activate,
                 error,
+                generation,
             }
         })
         .map(cosmic::Action::App)
     }
+
+    /// Spawn a snapshot refresh, coalescing concurrent triggers: while one
+    /// snapshot task is in flight, further requests collapse into a single
+    /// rerun once it answers.
+    fn request_snapshot(&mut self) -> Task<cosmic::Action<Message>> {
+        if self.snapshot_in_flight {
+            self.snapshot_rerequested = true;
+            return Task::none();
+        }
+        self.snapshot_in_flight = true;
+        snapshot_task().map(cosmic::Action::App)
+    }
+
+    fn snapshot_finished(&mut self) -> Task<cosmic::Action<Message>> {
+        self.snapshot_in_flight = false;
+        if std::mem::take(&mut self.snapshot_rerequested) {
+            self.request_snapshot()
+        } else {
+            Task::none()
+        }
+    }
+}
+
+/// Deliver [`Message::PendingVpnTimeout`] after `bound`, bounding how long
+/// the request issued under `generation` may stay pending.
+fn pending_vpn_timeout_task(
+    uuid: Arc<str>,
+    generation: u64,
+    bound: std::time::Duration,
+) -> Task<cosmic::Action<Message>> {
+    cosmic::task::future(async move {
+        tokio::time::sleep(bound).await;
+        Message::PendingVpnTimeout { uuid, generation }
+    })
+    .map(cosmic::Action::App)
 }
 
 /// Registers an `nmrs` secret agent on the system bus and yields its
@@ -1019,9 +1255,18 @@ pub(crate) enum Message {
     ActivateVpn(Arc<str>),   // UUID of VPN to activate
     DeactivateVpn(Arc<str>), // UUID of VPN to deactivate
     VpnOperationFinished {
-        uuid: Arc<str>,
         action: PendingVpnAction,
         error: Option<String>,
+        /// The request's [`PendingVpn::generation`], so a stale completion
+        /// can't clear a newer request's pending state.
+        generation: u64,
+    },
+    /// A VPN operation's pending state outlived its bound; clear it so the
+    /// spinner can't get stuck if the operation never resolves. Generation-
+    /// guarded like [`Message::VpnOperationFinished`].
+    PendingVpnTimeout {
+        uuid: Arc<str>,
+        generation: u64,
     },
     ToggleVpnList, // Show/hide available VPNs
     /// An update from the secret agent
@@ -1047,6 +1292,8 @@ pub(crate) enum Message {
     PasswordUpdate(SecureString),
     /// Update applet state from NetworkManager.
     Snapshot(AppletSnapshot),
+    /// A snapshot refresh failed; ends the in-flight snapshot request.
+    SnapshotFailed(String),
     /// Toggle WiFi access
     WiFiEnable(bool),
     /// Refresh state
@@ -1070,6 +1317,8 @@ impl cosmic::Application for CosmicNetworkApplet {
             core,
             icon_name: "network-wired-disconnected-symbolic".to_string(),
             token_tx: None,
+            // The batch below spawns the first snapshot directly.
+            snapshot_in_flight: true,
             ..Default::default()
         };
 
@@ -1104,7 +1353,7 @@ impl cosmic::Application for CosmicNetworkApplet {
                     return destroy_popup(p);
                 } else {
                     let mut tasks = Vec::with_capacity(2);
-                    tasks.push(snapshot_task().map(cosmic::Action::App));
+                    tasks.push(self.request_snapshot());
                     tasks.push(cosmic::surface::surface_task(
                         cosmic::surface::action::app_popup(
                             |_| Default::default(),
@@ -1282,58 +1531,94 @@ impl cosmic::Application for CosmicNetworkApplet {
                 ));
             }
             Message::ActivateVpn(uuid) => {
+                self.vpn_request_generation += 1;
+                let generation = self.vpn_request_generation;
                 self.nm_state.pending_vpn = Some(PendingVpn {
                     uuid: uuid.clone(),
                     action: PendingVpnAction::Activate,
+                    generation,
                 });
                 self.update_icon_name();
                 return Task::batch(vec![
-                    snapshot_task().map(cosmic::Action::App),
+                    self.request_snapshot(),
                     self.connect_vpn(uuid.clone()),
+                    pending_vpn_timeout_task(uuid, generation, VPN_ACTIVATE_PENDING_BOUND),
                 ]);
             }
             Message::DeactivateVpn(uuid) => {
+                self.vpn_request_generation += 1;
+                let generation = self.vpn_request_generation;
                 self.nm_state.pending_vpn = Some(PendingVpn {
                     uuid: uuid.clone(),
                     action: PendingVpnAction::Deactivate,
+                    generation,
                 });
                 self.update_icon_name();
-                let disconnect_task = cosmic::task::future(async move {
-                    let error = match NmrsManager::new().await {
-                        Ok(nm) => nm
-                            .disconnect_vpn_by_uuid(&uuid)
-                            .await
-                            .err()
-                            .map(|e| format!("disconnect VPN {uuid}: {e}")),
-                        Err(e) => Some(format!("nmrs init: {e}")),
-                    };
-                    Message::VpnOperationFinished {
-                        uuid,
-                        action: PendingVpnAction::Deactivate,
-                        error,
+                let disconnect_task = cosmic::task::future({
+                    let uuid = uuid.clone();
+                    async move {
+                        let error = match NmrsManager::new().await {
+                            Ok(nm) => nm
+                                .disconnect_vpn_by_uuid(&uuid)
+                                .await
+                                .err()
+                                .map(|e| format!("disconnect VPN {uuid}: {e}")),
+                            Err(e) => Some(format!("nmrs init: {e}")),
+                        };
+                        Message::VpnOperationFinished {
+                            action: PendingVpnAction::Deactivate,
+                            error,
+                            generation,
+                        }
                     }
                 })
                 .map(cosmic::Action::App);
                 return Task::batch(vec![
-                    snapshot_task().map(cosmic::Action::App),
+                    self.request_snapshot(),
                     disconnect_task,
+                    pending_vpn_timeout_task(uuid, generation, VPN_DEACTIVATE_PENDING_BOUND),
                 ]);
             }
             Message::VpnOperationFinished {
-                uuid,
                 action,
                 error,
+                generation,
             } => {
-                if self.nm_state.pending_vpn.as_ref().is_some_and(|pending| {
-                    pending.uuid.as_ref() == uuid.as_ref() && pending.action == action
-                }) {
+                // `disconnect_vpn_by_uuid` resolves as soon as deactivation is
+                // *requested*, not when it completes. Keep the pending state so
+                // the row shows a spinner instead of briefly flipping back to
+                // "connected"; `clear_completed_pending_vpn` ends it once a
+                // snapshot shows the VPN gone, bounded by the deactivation
+                // timeout armed when the request was issued.
+                if action == PendingVpnAction::Deactivate && error.is_none() {
+                    return self.request_snapshot();
+                }
+                if self
+                    .nm_state
+                    .pending_vpn
+                    .as_ref()
+                    .is_some_and(|pending| pending.generation == generation)
+                {
                     self.nm_state.pending_vpn = None;
                     self.update_icon_name();
                 }
                 if let Some(error) = error {
                     tracing::error!("{error}");
                 }
-                return snapshot_task().map(cosmic::Action::App);
+                return self.request_snapshot();
+            }
+            Message::PendingVpnTimeout { uuid, generation } => {
+                if self
+                    .nm_state
+                    .pending_vpn
+                    .as_ref()
+                    .is_some_and(|pending| pending.generation == generation)
+                {
+                    tracing::warn!("VPN {uuid} operation still pending at its timeout; clearing");
+                    self.nm_state.pending_vpn = None;
+                    self.update_icon_name();
+                    return self.request_snapshot();
+                }
             }
             Message::ToggleVpnList => {
                 self.show_available_vpns = !self.show_available_vpns;
@@ -1423,13 +1708,13 @@ impl cosmic::Application for CosmicNetworkApplet {
                     self.failed_known_ssids.insert(access_point.ssid.clone());
                     self.new_connection = Some(NewConnectionState::Failure(access_point));
                 }
-                return snapshot_task().map(cosmic::Action::App);
+                return self.request_snapshot();
             }
             Message::NetworkEvent(event) => {
                 if matches!(event, NetworkEvent::NetworkManagerRestarted) {
                     tracing::debug!("NetworkManager restarted; refreshing network snapshot");
                 }
-                return snapshot_task().map(cosmic::Action::App);
+                return self.request_snapshot();
             }
             Message::PasswordUpdate(entered_pw) => {
                 if let Some(NewConnectionState::EnterPassword { password, .. }) =
@@ -1440,6 +1725,11 @@ impl cosmic::Application for CosmicNetworkApplet {
             }
             Message::Snapshot(snapshot) => {
                 self.apply_snapshot(snapshot);
+                return self.snapshot_finished();
+            }
+            Message::SnapshotFailed(error) => {
+                tracing::error!("snapshot failed: {error}");
+                return self.snapshot_finished();
             }
             Message::WiFiEnable(enable) => {
                 self.nm_state.nm_state.wifi_enabled = enable;
@@ -1530,7 +1820,7 @@ impl cosmic::Application for CosmicNetworkApplet {
                 }
             },
             Message::Refresh => {
-                return snapshot_task().map(cosmic::Action::App);
+                return self.request_snapshot();
             }
             Message::ToggleVPNPasswordVisibility => {
                 if let Some(requested_vpn) = self.nm_state.requested_vpn.as_mut() {
@@ -1606,64 +1896,22 @@ impl cosmic::Application for CosmicNetworkApplet {
         let mut known_wifi = Vec::new();
         for conn in &self.nm_state.nm_state.active_conns {
             match conn {
-                ActiveConnectionInfo::Vpn {
-                    name,
-                    ip4_address,
-                    ip6_address,
-                } => {
-                    if self.active_device.as_ref().is_some_and(|d| {
-                        d.active_connection.as_ref().is_none_or(|a| a.0.id != *name)
-                    }) {
-                        continue;
-                    }
-                    let mut info_col = Vec::with_capacity(3);
-                    info_col.push(text::body(name).into());
-                    for elem in ip_address_elements(ip4_address, ip6_address) {
-                        info_col.push(elem);
-                    }
-                    vpn_ethernet_col = vpn_ethernet_col.push(
-                        column::with_capacity::<Message, cosmic::Theme, _>(2)
-                            .push(
-                                row::with_children([
-                                    Element::from(
-                                        icon::icon(
-                                            icon::from_name("network-vpn-symbolic")
-                                                .symbolic(true)
-                                                .into(),
-                                        )
-                                        .size(40),
-                                    ),
-                                    column::with_children(info_col).into(),
-                                    text::body(fl!("connected"))
-                                        .width(Length::Fill)
-                                        .align_x(Alignment::End)
-                                        .into(),
-                                ])
-                                .align_y(Alignment::Center)
-                                .spacing(8)
-                                .padding(menu_control_padding()),
-                            )
-                            .push(
-                                padded_control(divider::horizontal::default())
-                                    .padding([space_xxs, space_s]),
-                            ),
-                    );
-                }
+                // Active VPNs are rendered inline in `vpn_section`, not as a
+                // large panel at the top of the popup.
+                ActiveConnectionInfo::Vpn { .. } => continue,
                 ActiveConnectionInfo::Wired {
                     name,
                     hw_address: _,
                     speed,
                     ip4_address,
-                    ip6_address,
                 } => {
                     if self.active_device.as_ref().is_some_and(|d| {
                         d.active_connection.as_ref().is_none_or(|a| a.0.id != *name)
                     }) {
                         continue;
                     }
-                    let mut info_col = Vec::with_capacity(3);
-                    info_col.push(text::body(name).into());
-                    info_col.extend(ip_address_elements(ip4_address, ip6_address));
+                    let info_col: Vec<Element<'_, Message>> =
+                        vec![text::body(name).into(), ipv4_line(ip4_address.as_deref())];
 
                     let mut right_column = vec![text::body(fl!("connected")).into()];
 
@@ -1699,7 +1947,7 @@ impl cosmic::Application for CosmicNetworkApplet {
                                                 .symbolic(true)
                                                 .into(),
                                         )
-                                        .size(40),
+                                        .size(24),
                                     ),
                                     column::with_children(info_col).into(),
                                     column::with_children(right_column)
@@ -1720,7 +1968,6 @@ impl cosmic::Application for CosmicNetworkApplet {
                 ActiveConnectionInfo::WiFi {
                     name,
                     ip4_address,
-                    ip6_address,
                     state,
                     strength,
                     hw_address,
@@ -1730,7 +1977,6 @@ impl cosmic::Application for CosmicNetworkApplet {
                     }) {
                         continue;
                     }
-                    let ip_elements = ip_address_elements(ip4_address, ip6_address);
                     let mut btn_content = vec![
                         icon::from_name(wifi_icon(*strength))
                             .size(24)
@@ -1738,7 +1984,7 @@ impl cosmic::Application for CosmicNetworkApplet {
                             .into(),
                         column::with_children([
                             text::body(name).into(),
-                            column::with_children(ip_elements).into(),
+                            ipv4_line(ip4_address.as_deref()),
                         ])
                         .width(Length::Fill)
                         .into(),
@@ -1859,7 +2105,7 @@ impl cosmic::Application for CosmicNetworkApplet {
             );
 
             // Show VPN connections even in airplane mode
-            if !self.nm_state.known_vpns.is_empty() {
+            if has_vpn_rows(&self.nm_state) {
                 content = content.push(vpn_section(
                     &self.nm_state,
                     self.show_available_vpns,
@@ -1871,8 +2117,11 @@ impl cosmic::Application for CosmicNetworkApplet {
             return self.view_window_return(content);
         }
 
+        // With Wi-Fi disabled, saved VPN profiles take over the popup. Gated
+        // on saved profiles (not `has_vpn_rows`) so that an active unsaved
+        // VPN alone doesn't hide the adapter and known-network sections below
+        // — it still gets a VPN section from the later pushes.
         if !self.nm_state.nm_state.wifi_enabled && !self.nm_state.known_vpns.is_empty() {
-            // Add VPN connections section when WiFi is disabled
             content = content.push(vpn_section(
                 &self.nm_state,
                 self.show_available_vpns,
@@ -1931,6 +2180,15 @@ impl cosmic::Application for CosmicNetworkApplet {
                 ));
             }
 
+            if has_vpn_rows(&self.nm_state) {
+                content = content.push(vpn_section(
+                    &self.nm_state,
+                    self.show_available_vpns,
+                    space_xxs,
+                    space_s,
+                ));
+            }
+
             return self.view_window_return(content);
         }
 
@@ -1947,7 +2205,12 @@ impl cosmic::Application for CosmicNetworkApplet {
                 continue;
             }
             let mut btn_content = Vec::with_capacity(2);
-            let ssid = text::body(known.ssid.as_ref()).width(Length::Fill);
+            let ssid_col: Element<'_, Message> = column::with_children([
+                text::body(known.ssid.as_ref()).width(Length::Fill).into(),
+                ipv4_line(None),
+            ])
+            .width(Length::Fill)
+            .into();
             if known.working {
                 btn_content.push(
                     icon::from_name("network-wireless-acquiring-symbolic")
@@ -1955,7 +2218,7 @@ impl cosmic::Application for CosmicNetworkApplet {
                         .symbolic(true)
                         .into(),
                 );
-                btn_content.push(ssid.into());
+                btn_content.push(ssid_col);
                 btn_content.push(indeterminate_circular().size(24.0).into());
             } else if matches!(known.state, DeviceState::Unavailable) {
                 btn_content.push(
@@ -1964,7 +2227,7 @@ impl cosmic::Application for CosmicNetworkApplet {
                         .symbolic(true)
                         .into(),
                 );
-                btn_content.push(ssid.into());
+                btn_content.push(ssid_col);
             } else {
                 btn_content.push(
                     icon::from_name(wifi_icon(known.strength))
@@ -1972,7 +2235,7 @@ impl cosmic::Application for CosmicNetworkApplet {
                         .symbolic(true)
                         .into(),
                 );
-                btn_content.push(ssid.into());
+                btn_content.push(ssid_col);
             }
 
             if self.failed_known_ssids.contains(known.ssid.as_ref()) {
@@ -2035,7 +2298,7 @@ impl cosmic::Application for CosmicNetworkApplet {
         content = content.push(available_connections_btn);
 
         if !self.show_visible_networks {
-            if !self.nm_state.known_vpns.is_empty() {
+            if has_vpn_rows(&self.nm_state) {
                 content = content.push(vpn_section(
                     &self.nm_state,
                     self.show_available_vpns,
@@ -2221,7 +2484,7 @@ impl cosmic::Application for CosmicNetworkApplet {
         }
 
         // Add VPN connections section after wireless networks when they are expanded
-        if !self.nm_state.known_vpns.is_empty() && self.nm_state.nm_state.wifi_enabled {
+        if has_vpn_rows(&self.nm_state) {
             content = content.push(vpn_section(
                 &self.nm_state,
                 self.show_available_vpns,
