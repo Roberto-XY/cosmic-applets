@@ -425,6 +425,7 @@ fn vpn_section<'a>(
         vpn_col = vpn_col.push(vpn_toggle_btn);
 
         if show_available_vpns {
+            let mut vpn_list = Vec::with_capacity(nm_state.known_vpns.len());
             for (uuid, connection) in &nm_state.known_vpns {
                 let id = match connection {
                     ConnectionSettings::Vpn { id } | ConnectionSettings::Wireguard { id } => {
@@ -470,26 +471,31 @@ fn vpn_section<'a>(
                     btn.on_press(Message::ActivateVpn(uuid.clone()))
                 };
 
-                vpn_col = vpn_col.push(btn);
+                vpn_list.push(Element::from(btn));
             }
+            // Cap the list's height so a long list of saved VPNs scrolls
+            // instead of growing the popup unboundedly.
+            vpn_col = vpn_col.push(
+                container(scrollable::<'_, Message>(column::with_children(vpn_list))).max_height(300.0),
+            );
         }
     }
 
     vpn_col
 }
 
-fn ip_address_elements<'a>(
-    ip4_address: &Option<String>,
-    _ip6_address: &Option<String>,
-) -> Vec<Element<'a, Message>> {
-    let mut elements = Vec::with_capacity(1);
-    if let Some(addr) = ip4_address {
-        // Strip the subnet mask (e.g. "10.0.0.2/24" -> "10.0.0.2"); the drop-down
-        // only needs the address itself for glancing at the host on a local network.
-        let addr = addr.split('/').next().unwrap_or(addr.as_str());
-        elements.push(text(format!("{}: {}", fl!("ipv4"), addr)).size(12).into());
-    }
-    elements
+/// One caption line showing the IPv4 address, or an empty caption that
+/// still reserves the line's height, so sibling rows keep a uniform two-line
+/// size and the popup doesn't reflow as connection state changes.
+/// The IPv6 address is carried by callers but not rendered.
+fn ipv4_line<'a>(ip4_address: Option<&str>, _ip6_address: Option<&str>) -> Element<'a, Message> {
+    let Some(addr) = ip4_address else {
+        return text::caption("").into();
+    };
+    // Strip the subnet mask (e.g. "10.0.0.2/24" -> "10.0.0.2"); the drop-down
+    // only needs the address itself for glancing at the host on a local network.
+    let addr = addr.split('/').next().unwrap_or(addr);
+    text::caption(format!("{}: {}", fl!("ipv4"), addr)).into()
 }
 
 fn network_type(security: nmrs::SecurityFeatures) -> NetworkType {
@@ -612,8 +618,12 @@ fn network_events_task() -> Task<Message> {
 
 fn snapshot_to_applet(snapshot: NetworkSnapshot) -> AppletSnapshot {
     let summary = snapshot.applet_summary();
+    // Sort so the VPN list has a stable order across snapshots; iterating
+    // the map directly would reorder the list on every connect/disconnect.
+    let mut saved_vpns: Vec<_> = summary.saved_vpns.values().collect();
+    saved_vpns.sort_by_cached_key(|vpn| (vpn.id.to_lowercase(), vpn.uuid.clone()));
     let mut known_vpns = IndexMap::new();
-    for vpn in summary.saved_vpns.values() {
+    for vpn in saved_vpns {
         let uuid: Uuid = Arc::from(vpn.uuid.as_str());
         let entry = match vpn.kind {
             Some(nmrs::VpnKind::WireGuard) => ConnectionSettings::Wireguard { id: vpn.id.clone() },
@@ -636,6 +646,26 @@ fn snapshot_to_applet(snapshot: NetworkSnapshot) -> AppletSnapshot {
         .active_connections
         .iter()
         .filter_map(|conn| match conn {
+            // nmrs classifies active connections by device type first, so a
+            // VPN riding a wired device (e.g. a tun/tap-based client) comes
+            // back as Wired, not Vpn; normalize the ones whose profile is a
+            // saved VPN so they render as a VPN row instead of the wired
+            // "connected" panel.
+            ActiveConnection::Wired(wired)
+                if known_vpns.values().any(|connection| {
+                    matches!(
+                        connection,
+                        ConnectionSettings::Vpn { id } | ConnectionSettings::Wireguard { id }
+                            if id == &wired.id
+                    )
+                }) =>
+            {
+                Some(ActiveConnectionInfo::Vpn {
+                    name: wired.id.clone(),
+                    ip4_address: wired.ip4_address.clone(),
+                    ip6_address: wired.ip6_address.clone(),
+                })
+            }
             ActiveConnection::Wired(wired) => Some(ActiveConnectionInfo::Wired {
                 name: wired.id.clone(),
                 hw_address: wired.hw_address.clone().unwrap_or_default(),
@@ -1646,9 +1676,10 @@ impl cosmic::Application for CosmicNetworkApplet {
                     }) {
                         continue;
                     }
-                    let mut info_col = Vec::with_capacity(3);
-                    info_col.push(text::body(name).into());
-                    info_col.extend(ip_address_elements(ip4_address, ip6_address));
+                    let info_col: Vec<Element<'_, Message>> = vec![
+                        text::body(name).into(),
+                        ipv4_line(ip4_address.as_deref(), ip6_address.as_deref()),
+                    ];
 
                     let mut right_column = vec![text::body(fl!("connected")).into()];
 
@@ -1684,7 +1715,7 @@ impl cosmic::Application for CosmicNetworkApplet {
                                                 .symbolic(true)
                                                 .into(),
                                         )
-                                        .size(40),
+                                        .size(24),
                                     ),
                                     column::with_children(info_col).into(),
                                     column::with_children(right_column)
@@ -1715,7 +1746,6 @@ impl cosmic::Application for CosmicNetworkApplet {
                     }) {
                         continue;
                     }
-                    let ip_elements = ip_address_elements(ip4_address, ip6_address);
                     let mut btn_content = vec![
                         icon::from_name(wifi_icon(*strength))
                             .size(24)
@@ -1723,7 +1753,7 @@ impl cosmic::Application for CosmicNetworkApplet {
                             .into(),
                         column::with_children([
                             text::body(name).into(),
-                            column::with_children(ip_elements).into(),
+                            ipv4_line(ip4_address.as_deref(), ip6_address.as_deref()),
                         ])
                         .width(Length::Fill)
                         .into(),
@@ -1932,7 +1962,12 @@ impl cosmic::Application for CosmicNetworkApplet {
                 continue;
             }
             let mut btn_content = Vec::with_capacity(2);
-            let ssid = text::body(known.ssid.as_ref()).width(Length::Fill);
+            let ssid_col: Element<'_, Message> = column::with_children([
+                text::body(known.ssid.as_ref()).width(Length::Fill).into(),
+                ipv4_line(None, None),
+            ])
+            .width(Length::Fill)
+            .into();
             if known.working {
                 btn_content.push(
                     icon::from_name("network-wireless-acquiring-symbolic")
@@ -1940,7 +1975,7 @@ impl cosmic::Application for CosmicNetworkApplet {
                         .symbolic(true)
                         .into(),
                 );
-                btn_content.push(ssid.into());
+                btn_content.push(ssid_col);
                 btn_content.push(indeterminate_circular().size(24.0).into());
             } else if matches!(known.state, DeviceState::Unavailable) {
                 btn_content.push(
@@ -1949,7 +1984,7 @@ impl cosmic::Application for CosmicNetworkApplet {
                         .symbolic(true)
                         .into(),
                 );
-                btn_content.push(ssid.into());
+                btn_content.push(ssid_col);
             } else {
                 btn_content.push(
                     icon::from_name(wifi_icon(known.strength))
@@ -1957,7 +1992,7 @@ impl cosmic::Application for CosmicNetworkApplet {
                         .symbolic(true)
                         .into(),
                 );
-                btn_content.push(ssid.into());
+                btn_content.push(ssid_col);
             }
 
             if self.failed_known_ssids.contains(known.ssid.as_ref()) {
