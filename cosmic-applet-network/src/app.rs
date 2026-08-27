@@ -377,6 +377,18 @@ fn wifi_icon(strength: u8) -> &'static str {
     }
 }
 
+/// Whether the popup has any VPN rows to show: saved profiles, or an active
+/// VPN without a matching profile (activated externally, or seen before the
+/// saved connections finish loading).
+fn has_vpn_rows(nm_state: &MyNetworkState) -> bool {
+    !nm_state.known_vpns.is_empty()
+        || nm_state
+            .nm_state
+            .active_conns
+            .iter()
+            .any(|conn| matches!(conn, ActiveConnectionInfo::Vpn { .. }))
+}
+
 /// Best-state summary of the active connections matching a VPN profile UUID.
 /// NM can briefly list several connections for one profile during a quick
 /// reconnect, so prefer the most-alive entry over whichever is listed first.
@@ -412,141 +424,266 @@ fn active_vpn_status<'a>(
     best
 }
 
+/// Trailing status widget shared by VPN rows and the collapsed toggle row: a
+/// spinner while busy, otherwise the given label (e.g. "connected" or the
+/// connected VPN's name), or nothing.
+fn vpn_trailing_status<'a>(busy: bool, label: Option<String>) -> Option<Element<'a, Message>> {
+    if busy {
+        return Some(indeterminate_circular().size(24.0).into());
+    }
+    label.map(|label| {
+        text::body(label)
+            .height(Length::Fixed(24.0))
+            .align_y(Alignment::Center)
+            .into()
+    })
+}
+
+/// Derive a VPN row's spinner/label/press state from the profile's best
+/// active status and whether the applet's own request is pending on it.
+/// Only an applet-side pending request locks the row; an NM-side transition
+/// shows the spinner but keeps Deactivate pressable, so a hung activation can
+/// still be cancelled. Any still-listed connection gets Deactivate — even in
+/// odd states like Unknown — so a lingering connection can always be torn
+/// down; only a fully absent one may Activate (saved profiles only).
+fn vpn_row_props(
+    status: Option<(ActiveConnectionState, Option<&str>)>,
+    pending: bool,
+    uuid: &Uuid,
+    can_activate: bool,
+) -> (bool, bool, Option<Message>) {
+    let transitioning = matches!(
+        status,
+        Some((
+            ActiveConnectionState::Activating | ActiveConnectionState::Deactivating,
+            _
+        ))
+    );
+    let activated = matches!(status, Some((ActiveConnectionState::Activated, _)));
+    let busy = pending || transitioning;
+    let on_press = if pending {
+        None
+    } else if status.is_some() {
+        Some(Message::DeactivateVpn(uuid.clone()))
+    } else if can_activate {
+        Some(Message::ActivateVpn(uuid.clone()))
+    } else {
+        None
+    };
+    (busy, activated, on_press)
+}
+
+/// One list row for a VPN: icon, name over the IPv4 caption line, and a
+/// trailing spinner (busy) or "connected" label.
+fn vpn_row<'a>(
+    name: &'a str,
+    ip4_address: Option<&'a str>,
+    ip6_address: Option<&'a str>,
+    busy: bool,
+    activated: bool,
+    on_press: Option<Message>,
+) -> Element<'a, Message> {
+    let mut content: Vec<Element<'a, Message>> = vec![
+        icon::from_name("network-vpn-symbolic")
+            .size(24)
+            .symbolic(true)
+            .into(),
+        column::with_children([text::body(name).into(), ipv4_line(ip4_address, ip6_address)])
+            .width(Length::Fill)
+            .into(),
+    ];
+    if let Some(status) = vpn_trailing_status(busy, activated.then(|| fl!("connected"))) {
+        content.push(status);
+    }
+    let mut btn = menu_button(
+        row::with_children(content)
+            .align_y(Alignment::Center)
+            .spacing(8),
+    );
+    if let Some(message) = on_press {
+        btn = btn.on_press(message);
+    }
+    btn.into()
+}
+
 fn vpn_section<'a>(
     nm_state: &'a MyNetworkState,
     show_available_vpns: bool,
     space_xxs: u16,
     space_s: u16,
-) -> cosmic::iced::widget::Column<'a, Message, cosmic::Theme> {
-    let mut vpn_col = cosmic::widget::column::with_capacity::<'_, Message, cosmic::Theme, _>(4);
-
-    if !nm_state.known_vpns.is_empty() {
-        let dropdown_icon = if show_available_vpns {
-            "go-up-symbolic"
-        } else {
-            "go-down-symbolic"
-        };
-
-        vpn_col = vpn_col
-            .push(padded_control(divider::horizontal::default()).padding([space_xxs, space_s]));
-
-        if let Some(requested_vpn) = nm_state.requested_vpn.as_ref() {
-            let column_content = vec![
-                text::body(
-                    requested_vpn
-                        .description
-                        .as_deref()
-                        .unwrap_or(requested_vpn.uuid.as_ref()),
-                )
-                .width(Length::Fill)
-                .into(),
-                secure_input(
-                    "",
-                    Cow::Borrowed(requested_vpn.password.unsecure()),
-                    Some(Message::ToggleVPNPasswordVisibility),
-                    requested_vpn.password_hidden,
-                )
-                .on_input(|s| Message::VPNPasswordUpdate(s.into()))
-                .on_paste(|s| Message::VPNPasswordUpdate(s.into()))
-                .on_submit(|_| Message::ConnectVPNWithPassword)
-                .width(Length::Fill)
-                .into(),
-                row::with_children([
-                    button::standard(fl!("cancel"))
-                        .on_press(Message::CancelVPNConnection)
-                        .into(),
-                    button::suggested(fl!("connect"))
-                        .on_press(Message::ConnectVPNWithPassword)
-                        .into(),
-                ])
-                .spacing(24)
-                .into(),
-            ];
-            let col: Element<'a, Message> = Element::from(
-                padded_control(
-                    column::with_children(column_content)
-                        .spacing(8)
-                        .align_x(Alignment::Center),
-                )
-                .align_x(Alignment::Center),
-            );
-            vpn_col = vpn_col.push(col);
-        }
-
-        let vpn_toggle_btn = menu_button(row::with_children([
-            Element::from(
-                text::body(fl!("vpn-connections"))
-                    .width(Length::Fill)
-                    .height(Length::Fixed(24.0))
-                    .align_y(Alignment::Center),
-            ),
-            container(icon::from_name(dropdown_icon).size(16).symbolic(true))
-                .center(Length::Fixed(24.0))
-                .into(),
-        ]))
-        .on_press(Message::ToggleVpnList);
-
-        vpn_col = vpn_col.push(vpn_toggle_btn);
-
-        if show_available_vpns {
-            let mut vpn_list = Vec::with_capacity(nm_state.known_vpns.len());
-            for (uuid, connection) in &nm_state.known_vpns {
-                let id = match connection {
-                    ConnectionSettings::Vpn { id } | ConnectionSettings::Wireguard { id } => {
-                        id.as_str()
-                    }
-                };
-                // Check if this VPN is currently active
-                let is_active = nm_state.nm_state.active_conns.iter().any(
-                    |conn| matches!(conn, ActiveConnectionInfo::Vpn { name, .. } if name == id),
-                );
-                let pending_action = nm_state
-                    .pending_vpn
-                    .as_ref()
-                    .filter(|pending| pending.uuid.as_ref() == uuid.as_ref())
-                    .map(|pending| pending.action);
-
-                let mut btn_content = vec![
-                    icon::from_name("network-vpn-symbolic")
-                        .size(24)
-                        .symbolic(true)
-                        .into(),
-                    text::body(id).width(Length::Fill).into(),
-                ];
-
-                if is_active {
-                    btn_content.push(text::body(fl!("connected")).align_x(Alignment::End).into());
-                }
-                if pending_action.is_some() {
-                    btn_content.push(indeterminate_circular().size(24.0).into());
-                }
-
-                let mut btn = menu_button(
-                    row::with_children(btn_content)
-                        .align_y(Alignment::Center)
-                        .spacing(8),
-                );
-
-                btn = if pending_action.is_some() {
-                    btn
-                } else if is_active {
-                    btn.on_press(Message::DeactivateVpn(uuid.clone()))
-                } else {
-                    btn.on_press(Message::ActivateVpn(uuid.clone()))
-                };
-
-                vpn_list.push(Element::from(btn));
-            }
-            // Cap the list's height so a long list of saved VPNs scrolls
-            // instead of growing the popup unboundedly.
-            vpn_col = vpn_col.push(
-                container(scrollable::<'_, Message>(column::with_children(vpn_list)))
-                    .max_height(300.0),
-            );
-        }
+) -> Option<cosmic::iced::widget::Column<'a, Message, cosmic::Theme>> {
+    // The visibility condition lives only here; callers push whatever they
+    // get and add nothing when this returns None.
+    if !has_vpn_rows(nm_state) {
+        return None;
     }
 
-    vpn_col
+    let mut vpn_col = cosmic::widget::column::with_capacity::<'_, Message, cosmic::Theme, _>(4);
+
+    let dropdown_icon = if show_available_vpns {
+        "go-up-symbolic"
+    } else {
+        "go-down-symbolic"
+    };
+
+    vpn_col =
+        vpn_col.push(padded_control(divider::horizontal::default()).padding([space_xxs, space_s]));
+
+    if let Some(requested_vpn) = nm_state.requested_vpn.as_ref() {
+        let column_content = vec![
+            text::body(
+                requested_vpn
+                    .description
+                    .as_deref()
+                    .unwrap_or(requested_vpn.uuid.as_ref()),
+            )
+            .width(Length::Fill)
+            .into(),
+            secure_input(
+                "",
+                Cow::Borrowed(requested_vpn.password.unsecure()),
+                Some(Message::ToggleVPNPasswordVisibility),
+                requested_vpn.password_hidden,
+            )
+            .on_input(|s| Message::VPNPasswordUpdate(s.into()))
+            .on_paste(|s| Message::VPNPasswordUpdate(s.into()))
+            .on_submit(|_| Message::ConnectVPNWithPassword)
+            .width(Length::Fill)
+            .into(),
+            row::with_children([
+                button::standard(fl!("cancel"))
+                    .on_press(Message::CancelVPNConnection)
+                    .into(),
+                button::suggested(fl!("connect"))
+                    .on_press(Message::ConnectVPNWithPassword)
+                    .into(),
+            ])
+            .spacing(24)
+            .into(),
+        ];
+        let col: Element<'a, Message> = Element::from(
+            padded_control(
+                column::with_children(column_content)
+                    .spacing(8)
+                    .align_x(Alignment::Center),
+            )
+            .align_x(Alignment::Center),
+        );
+        vpn_col = vpn_col.push(col);
+    }
+
+    let mut toggle_content = vec![Element::from(
+        text::body(fl!("vpn-connections"))
+            .width(Length::Fill)
+            .height(Length::Fixed(24.0))
+            .align_y(Alignment::Center),
+    )];
+    // While collapsed, indicate VPN state on the toggle row itself.
+    if !show_available_vpns {
+        let busy = nm_state.pending_vpn.is_some()
+            || nm_state.nm_state.active_conns.iter().any(|c| {
+                matches!(
+                    c,
+                    ActiveConnectionInfo::Vpn {
+                        state: ActiveConnectionState::Activating
+                            | ActiveConnectionState::Deactivating,
+                        ..
+                    }
+                )
+            });
+        let any_activated = nm_state.nm_state.active_conns.iter().any(|c| {
+            matches!(
+                c,
+                ActiveConnectionInfo::Vpn {
+                    state: ActiveConnectionState::Activated,
+                    ..
+                }
+            )
+        });
+        let label = any_activated.then(|| fl!("connected"));
+        if let Some(status) = vpn_trailing_status(busy, label) {
+            toggle_content.push(status);
+        }
+    }
+    toggle_content.push(
+        container(icon::from_name(dropdown_icon).size(16).symbolic(true))
+            .center(Length::Fixed(24.0))
+            .into(),
+    );
+    let vpn_toggle_btn =
+        menu_button(row::with_children(toggle_content).spacing(8)).on_press(Message::ToggleVpnList);
+
+    vpn_col = vpn_col.push(vpn_toggle_btn);
+
+    if show_available_vpns {
+        let mut vpn_list = Vec::with_capacity(nm_state.known_vpns.len());
+        for (uuid, connection) in &nm_state.known_vpns {
+            let id = match connection {
+                ConnectionSettings::Vpn { id } | ConnectionSettings::Wireguard { id } => {
+                    id.as_str()
+                }
+            };
+            let pending = nm_state
+                .pending_vpn
+                .as_ref()
+                .is_some_and(|pending| pending.uuid.as_ref() == uuid.as_ref());
+            let status = active_vpn_status(&nm_state.nm_state.active_conns, uuid.as_ref());
+            let (busy, activated, on_press) = vpn_row_props(status, pending, uuid, true);
+            vpn_list.push(vpn_row(
+                id,
+                status.and_then(|(_, ip4)| ip4),
+                None,
+                busy,
+                activated,
+                on_press,
+            ));
+        }
+        // Active VPNs without a matching saved profile (activated
+        // externally, or seen before the profiles finish loading) are
+        // still listed, and can be torn down via their connection UUID.
+        // Deduped by UUID — with the best state via `active_vpn_status` —
+        // because NM can briefly list several connections for one profile
+        // during a quick reconnect.
+        let mut unsaved: Vec<&Uuid> = Vec::new();
+        for conn in &nm_state.nm_state.active_conns {
+            let ActiveConnectionInfo::Vpn {
+                name,
+                uuid,
+                ip6_address,
+                ..
+            } = conn
+            else {
+                continue;
+            };
+            if nm_state.known_vpns.contains_key(uuid.as_ref())
+                || unsaved.iter().any(|seen| seen.as_ref() == uuid.as_ref())
+            {
+                continue;
+            }
+            unsaved.push(uuid);
+            let pending = nm_state
+                .pending_vpn
+                .as_ref()
+                .is_some_and(|pending| pending.uuid.as_ref() == uuid.as_ref());
+            let status = active_vpn_status(&nm_state.nm_state.active_conns, uuid.as_ref());
+            let (busy, activated, on_press) = vpn_row_props(status, pending, uuid, false);
+            vpn_list.push(vpn_row(
+                name,
+                status.and_then(|(_, ip4)| ip4),
+                ip6_address.as_deref(),
+                busy,
+                activated,
+                on_press,
+            ));
+        }
+        // Cap the list's height so a long list of saved VPNs scrolls
+        // instead of growing the popup unboundedly.
+        vpn_col = vpn_col.push(
+            container(scrollable::<'_, Message>(column::with_children(vpn_list))).max_height(300.0),
+        );
+    }
+
+    Some(vpn_col)
 }
 
 /// One caption line showing the IPv4 address, or an empty caption that
@@ -2072,26 +2209,25 @@ impl cosmic::Application for CosmicNetworkApplet {
             );
 
             // Show VPN connections even in airplane mode
-            if !self.nm_state.known_vpns.is_empty() {
-                content = content.push(vpn_section(
-                    &self.nm_state,
-                    self.show_available_vpns,
-                    space_xxs,
-                    space_s,
-                ));
+            if let Some(section) =
+                vpn_section(&self.nm_state, self.show_available_vpns, space_xxs, space_s)
+            {
+                content = content.push(section);
             }
 
             return self.view_window_return(content);
         }
 
-        if !self.nm_state.nm_state.wifi_enabled && !self.nm_state.known_vpns.is_empty() {
-            // Add VPN connections section when WiFi is disabled
-            content = content.push(vpn_section(
-                &self.nm_state,
-                self.show_available_vpns,
-                space_xxs,
-                space_s,
-            ));
+        // With Wi-Fi disabled, saved VPN profiles take over the popup. Gated
+        // on saved profiles (not the section's own visibility) so that an
+        // active unsaved VPN alone doesn't hide the adapter and known-network
+        // sections below — it still gets a VPN section from the later pushes.
+        if !self.nm_state.nm_state.wifi_enabled
+            && !self.nm_state.known_vpns.is_empty()
+            && let Some(section) =
+                vpn_section(&self.nm_state, self.show_available_vpns, space_xxs, space_s)
+        {
+            content = content.push(section);
 
             return self.view_window_return(content);
         }
@@ -2142,6 +2278,12 @@ impl cosmic::Application for CosmicNetworkApplet {
                     )
                     .on_press(Message::SelectDevice(Some(interface.clone()))),
                 ));
+            }
+
+            if let Some(section) =
+                vpn_section(&self.nm_state, self.show_available_vpns, space_xxs, space_s)
+            {
+                content = content.push(section);
             }
 
             return self.view_window_return(content);
@@ -2253,13 +2395,10 @@ impl cosmic::Application for CosmicNetworkApplet {
         content = content.push(available_connections_btn);
 
         if !self.show_visible_networks {
-            if !self.nm_state.known_vpns.is_empty() {
-                content = content.push(vpn_section(
-                    &self.nm_state,
-                    self.show_available_vpns,
-                    space_xxs,
-                    space_s,
-                ));
+            if let Some(section) =
+                vpn_section(&self.nm_state, self.show_available_vpns, space_xxs, space_s)
+            {
+                content = content.push(section);
             }
             return self.view_window_return(content);
         }
@@ -2439,13 +2578,10 @@ impl cosmic::Application for CosmicNetworkApplet {
         }
 
         // Add VPN connections section after wireless networks when they are expanded
-        if !self.nm_state.known_vpns.is_empty() && self.nm_state.nm_state.wifi_enabled {
-            content = content.push(vpn_section(
-                &self.nm_state,
-                self.show_available_vpns,
-                space_xxs,
-                space_s,
-            ));
+        if let Some(section) =
+            vpn_section(&self.nm_state, self.show_available_vpns, space_xxs, space_s)
+        {
+            content = content.push(section);
         }
 
         self.view_window_return(content)
