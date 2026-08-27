@@ -184,8 +184,13 @@ pub enum ActiveConnectionInfo {
     },
     Vpn {
         name: String,
+        /// The connection profile UUID. Profile ids need not be unique, so
+        /// matching against saved profiles or pending operations must use
+        /// this, never `name`.
+        uuid: Uuid,
         ip4_address: Option<String>,
         ip6_address: Option<String>,
+        state: ActiveConnectionState,
     },
 }
 
@@ -278,6 +283,10 @@ pub struct RequestedVpn {
 pub struct PendingVpn {
     uuid: Arc<str>,
     action: PendingVpnAction,
+    /// The `vpn_request_generation` this request was issued under. Timeout
+    /// and completion messages carry the same value, so a stale message from
+    /// an earlier request can't clear a newer request's pending state.
+    generation: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -285,6 +294,18 @@ pub enum PendingVpnAction {
     Activate,
     Deactivate,
 }
+
+/// Applet-side bound on a pending activation. nmrs already bounds the
+/// post-request wait at 30s, so this only guards against the preceding
+/// D-Bus calls hanging (e.g. NetworkManager restarting).
+const VPN_ACTIVATE_PENDING_BOUND: std::time::Duration = std::time::Duration::from_secs(45);
+/// Applet-side bound on a pending deactivation. `disconnect_vpn_by_uuid`
+/// resolves at request time, so this covers the actual teardown.
+const VPN_DEACTIVATE_PENDING_BOUND: std::time::Duration = std::time::Duration::from_secs(15);
+/// Delay before reconnecting the NetworkManager event stream after it ends or
+/// fails. The stream is the applet's only long-lived refresh trigger, so it
+/// must not be allowed to die for the rest of the session.
+const NETWORK_EVENTS_RECONNECT_DELAY: std::time::Duration = std::time::Duration::from_secs(3);
 
 #[derive(Clone, Debug)]
 pub enum ConnectionSettings {
@@ -334,6 +355,14 @@ struct CosmicNetworkApplet {
 
     /// When defined, displays connections for the specific device.
     active_device: Option<Arc<DeviceInfo>>,
+
+    /// Monotonic id handed to each VPN activate/deactivate request; see
+    /// [`PendingVpn::generation`].
+    vpn_request_generation: u64,
+    /// Coalesces snapshot refreshes: at most one snapshot task runs at a
+    /// time, with at most one rerun queued behind it.
+    snapshot_in_flight: bool,
+    snapshot_rerequested: bool,
 }
 
 fn wifi_icon(strength: u8) -> &'static str {
@@ -346,6 +375,41 @@ fn wifi_icon(strength: u8) -> &'static str {
     } else {
         "network-wireless-signal-excellent-symbolic"
     }
+}
+
+/// Best-state summary of the active connections matching a VPN profile UUID.
+/// NM can briefly list several connections for one profile during a quick
+/// reconnect, so prefer the most-alive entry over whichever is listed first.
+fn active_vpn_status<'a>(
+    active_conns: &'a [ActiveConnectionInfo],
+    uuid: &str,
+) -> Option<(ActiveConnectionState, Option<&'a str>)> {
+    fn rank(state: ActiveConnectionState) -> u8 {
+        match state {
+            ActiveConnectionState::Activated => 2,
+            ActiveConnectionState::Activating | ActiveConnectionState::Deactivating => 1,
+            _ => 0,
+        }
+    }
+    let mut best: Option<(ActiveConnectionState, Option<&'a str>)> = None;
+    for conn in active_conns {
+        let ActiveConnectionInfo::Vpn {
+            uuid: conn_uuid,
+            ip4_address,
+            state,
+            ..
+        } = conn
+        else {
+            continue;
+        };
+        if conn_uuid.as_ref() != uuid {
+            continue;
+        }
+        if best.is_none_or(|(b, _)| rank(*state) > rank(b)) {
+            best = Some((*state, ip4_address.as_deref()));
+        }
+    }
+    best
 }
 
 fn vpn_section<'a>(
@@ -476,7 +540,8 @@ fn vpn_section<'a>(
             // Cap the list's height so a long list of saved VPNs scrolls
             // instead of growing the popup unboundedly.
             vpn_col = vpn_col.push(
-                container(scrollable::<'_, Message>(column::with_children(vpn_list))).max_height(300.0),
+                container(scrollable::<'_, Message>(column::with_children(vpn_list)))
+                    .max_height(300.0),
             );
         }
     }
@@ -566,52 +631,99 @@ fn connect_access_point_task(
     .map(cosmic::Action::App)
 }
 
+/// Whether a snapshot error is the transient "object vanished mid-read" race:
+/// NM D-Bus objects (e.g. VPN tun devices) can disappear between the
+/// sequential reads inside `nmrs`'s snapshot, failing the whole snapshot with
+/// `org.freedesktop.DBus.Error.UnknownObject`. Matched on the typed error, not
+/// the message text, so a rewording in NM/zbus can't silently break the retry.
+fn is_transient_snapshot_error(error: &nmrs::ConnectionError) -> bool {
+    use nmrs::raw::zbus;
+    let source = match error {
+        nmrs::ConnectionError::Dbus(source) => source,
+        nmrs::ConnectionError::DbusOperation { source, .. } => source,
+        _ => return false,
+    };
+    match source {
+        zbus::Error::FDO(fdo) => matches!(**fdo, zbus::fdo::Error::UnknownObject(_)),
+        zbus::Error::MethodError(name, _, _) => name.as_str().ends_with(".UnknownObject"),
+        _ => false,
+    }
+}
+
 fn snapshot_task() -> Task<Message> {
     cosmic::task::future(async move {
         let nm = match NmrsManager::new().await {
             Ok(nm) => nm,
-            Err(e) => return Message::Error(format!("nmrs init: {e}")),
+            Err(e) => return Message::SnapshotFailed(format!("nmrs init: {e}")),
         };
 
-        match nm.snapshot().await {
-            Ok(snapshot) => Message::Snapshot(snapshot_to_applet(snapshot)),
-            Err(e) => Message::Error(format!("snapshot: {e}")),
+        // Snapshots race NetworkManager device churn (e.g. VPN tun devices
+        // appearing/disappearing), which makes the whole snapshot fail with a
+        // transient UnknownObject error. Retry only that error; anything else
+        // is reported immediately.
+        let mut last_err = None;
+        for attempt in 0..3 {
+            if attempt > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            }
+            match nm.snapshot().await {
+                Ok(snapshot) => return Message::Snapshot(snapshot_to_applet(snapshot)),
+                Err(e) => {
+                    if !is_transient_snapshot_error(&e) {
+                        return Message::SnapshotFailed(format!("snapshot: {e}"));
+                    }
+                    tracing::debug!("snapshot attempt {attempt} failed: {e}");
+                    last_err = Some(e);
+                }
+            }
         }
+        Message::SnapshotFailed(format!("snapshot: {}", last_err.unwrap()))
     })
 }
 
 fn network_events_task() -> Task<Message> {
     cosmic::Task::stream(async_fn_stream::fn_stream(|emitter| async move {
-        let nm = match NmrsManager::new().await {
-            Ok(nm) => nm,
-            Err(e) => {
-                let _ = emitter
-                    .emit(Message::Error(format!("nmrs init: {e}")))
-                    .await;
-                return;
-            }
-        };
-        let mut events = match nm.network_events().await {
-            Ok(events) => events,
-            Err(e) => {
-                let _ = emitter
-                    .emit(Message::Error(format!("network events: {e}")))
-                    .await;
-                return;
-            }
-        };
-
-        while let Some(event) = events.next().await {
-            match event {
-                Ok(event) => {
-                    let _ = emitter.emit(Message::NetworkEvent(event)).await;
-                }
+        // Reconnect with a delay whenever the stream fails or ends (e.g.
+        // a D-Bus hiccup or NetworkManager restart). Without this the applet
+        // would be event-blind for the rest of the session: no snapshot
+        // refreshes, no secret-agent re-registration.
+        loop {
+            let nm = match NmrsManager::new().await {
+                Ok(nm) => nm,
                 Err(e) => {
                     let _ = emitter
-                        .emit(Message::Error(format!("network event: {e}")))
+                        .emit(Message::Error(format!("nmrs init: {e}")))
                         .await;
+                    tokio::time::sleep(NETWORK_EVENTS_RECONNECT_DELAY).await;
+                    continue;
+                }
+            };
+            let mut events = match nm.network_events().await {
+                Ok(events) => events,
+                Err(e) => {
+                    let _ = emitter
+                        .emit(Message::Error(format!("network events: {e}")))
+                        .await;
+                    tokio::time::sleep(NETWORK_EVENTS_RECONNECT_DELAY).await;
+                    continue;
+                }
+            };
+
+            while let Some(event) = events.next().await {
+                match event {
+                    Ok(event) => {
+                        let _ = emitter.emit(Message::NetworkEvent(event)).await;
+                    }
+                    Err(e) => {
+                        let _ = emitter
+                            .emit(Message::Error(format!("network event: {e}")))
+                            .await;
+                    }
                 }
             }
+            // Events may have been missed while the stream was down; resync.
+            let _ = emitter.emit(Message::Refresh).await;
+            tokio::time::sleep(NETWORK_EVENTS_RECONNECT_DELAY).await;
         }
     }))
 }
@@ -647,23 +759,20 @@ fn snapshot_to_applet(snapshot: NetworkSnapshot) -> AppletSnapshot {
         .iter()
         .filter_map(|conn| match conn {
             // nmrs classifies active connections by device type first, so a
-            // VPN riding a wired device (e.g. a tun/tap-based client) comes
-            // back as Wired, not Vpn; normalize the ones whose profile is a
-            // saved VPN so they render as a VPN row instead of the wired
-            // "connected" panel.
-            ActiveConnection::Wired(wired)
-                if known_vpns.values().any(|connection| {
-                    matches!(
-                        connection,
-                        ConnectionSettings::Vpn { id } | ConnectionSettings::Wireguard { id }
-                            if id == &wired.id
-                    )
-                }) =>
-            {
+            // VPN riding a wired or Wi-Fi device comes back as Wired/Wifi,
+            // not Vpn; normalize the ones whose profile is a saved VPN.
+            // Matching by UUID (not id/ssid) keeps a genuine network whose
+            // name coincides with a VPN profile name from being
+            // misclassified. (An *unsaved* VPN riding a device still slips
+            // through as Wired/Wifi: nmrs does not expose the connection
+            // type on device-classified entries.)
+            ActiveConnection::Wired(wired) if known_vpns.contains_key(wired.uuid.as_str()) => {
                 Some(ActiveConnectionInfo::Vpn {
                     name: wired.id.clone(),
+                    uuid: Arc::from(wired.uuid.as_str()),
                     ip4_address: wired.ip4_address.clone(),
                     ip6_address: wired.ip6_address.clone(),
+                    state: wired.state,
                 })
             }
             ActiveConnection::Wired(wired) => Some(ActiveConnectionInfo::Wired {
@@ -673,19 +782,13 @@ fn snapshot_to_applet(snapshot: NetworkSnapshot) -> AppletSnapshot {
                 ip4_address: wired.ip4_address.clone(),
                 ip6_address: wired.ip6_address.clone(),
             }),
-            ActiveConnection::Wifi(wifi)
-                if known_vpns.values().any(|connection| {
-                    matches!(
-                        connection,
-                        ConnectionSettings::Vpn { id } | ConnectionSettings::Wireguard { id }
-                            if id == &wifi.ssid
-                    )
-                }) =>
-            {
+            ActiveConnection::Wifi(wifi) if known_vpns.contains_key(wifi.uuid.as_str()) => {
                 Some(ActiveConnectionInfo::Vpn {
                     name: wifi.ssid.clone(),
+                    uuid: Arc::from(wifi.uuid.as_str()),
                     ip4_address: wifi.ip4_address.clone(),
                     ip6_address: wifi.ip6_address.clone(),
+                    state: wifi.state,
                 })
             }
             ActiveConnection::Wifi(wifi) => Some(ActiveConnectionInfo::WiFi {
@@ -698,8 +801,10 @@ fn snapshot_to_applet(snapshot: NetworkSnapshot) -> AppletSnapshot {
             }),
             ActiveConnection::Vpn(vpn) => Some(ActiveConnectionInfo::Vpn {
                 name: vpn.id.clone(),
+                uuid: Arc::from(vpn.uuid.as_str()),
                 ip4_address: vpn.ip4_address.clone(),
                 ip6_address: vpn.ip6_address.clone(),
+                state: vpn.state,
             }),
             ActiveConnection::Other(_) | _ => None,
         })
@@ -819,23 +924,26 @@ impl CosmicNetworkApplet {
         let Some(pending) = self.nm_state.pending_vpn.as_ref() else {
             return;
         };
-        let Some(connection) = self.nm_state.known_vpns.get(&pending.uuid) else {
-            self.nm_state.pending_vpn = None;
-            self.update_icon_name();
-            return;
-        };
-        let id = match connection {
-            ConnectionSettings::Vpn { id } | ConnectionSettings::Wireguard { id } => id,
-        };
-        let is_active = self
-            .nm_state
-            .nm_state
-            .active_conns
-            .iter()
-            .any(|conn| matches!(conn, ActiveConnectionInfo::Vpn { name, .. } if name == id));
+        // NM lists a VPN under active connections as soon as activation
+        // starts; only `Activated` means the tunnel is actually up.
+        let status = active_vpn_status(&self.nm_state.nm_state.active_conns, &pending.uuid);
         let completed = match pending.action {
-            PendingVpnAction::Activate => is_active,
-            PendingVpnAction::Deactivate => !is_active,
+            PendingVpnAction::Activate => {
+                matches!(status, Some((ActiveConnectionState::Activated, _)))
+            }
+            // NM can keep the active-connection object listed briefly after
+            // teardown; an entry no longer alive or transitioning (e.g.
+            // already `Deactivated`) counts as gone, so the spinner doesn't
+            // outlive the operation waiting for the object to vanish.
+            PendingVpnAction::Deactivate => !matches!(
+                status,
+                Some((
+                    ActiveConnectionState::Activated
+                        | ActiveConnectionState::Activating
+                        | ActiveConnectionState::Deactivating,
+                    _
+                ))
+            ),
         };
         if completed {
             self.nm_state.pending_vpn = None;
@@ -884,12 +992,15 @@ impl CosmicNetworkApplet {
             .pending_vpn
             .as_ref()
             .is_some_and(|pending| pending.action == PendingVpnAction::Activate)
-            || self
-                .nm_state
-                .nm_state
-                .active_conns
-                .iter()
-                .any(|conn| matches!(conn, ActiveConnectionInfo::Vpn { .. }))
+            || self.nm_state.nm_state.active_conns.iter().any(|conn| {
+                matches!(
+                    conn,
+                    ActiveConnectionInfo::Vpn {
+                        state: ActiveConnectionState::Activating | ActiveConnectionState::Activated,
+                        ..
+                    }
+                )
+            })
         {
             self.icon_name = "network-vpn-symbolic".to_string();
             return;
@@ -942,24 +1053,73 @@ impl CosmicNetworkApplet {
             .into()
     }
 
-    fn connect_vpn(&mut self, uuid: Arc<str>) -> Task<cosmic::Action<Message>> {
-        cosmic::task::future(async move {
-            let error = match NmrsManager::new().await {
-                Ok(nm) => nm
-                    .connect_vpn_by_uuid(&uuid)
-                    .await
-                    .err()
-                    .map(|e| format!("activate VPN {uuid}: {e}")),
-                Err(e) => Some(format!("nmrs init: {e}")),
-            };
-            Message::VpnOperationFinished {
-                uuid,
-                action: PendingVpnAction::Activate,
-                error,
-            }
-        })
-        .map(cosmic::Action::App)
+    /// Spawn a snapshot refresh, coalescing concurrent triggers: while one
+    /// snapshot task is in flight, further requests collapse into a single
+    /// rerun once it answers.
+    fn request_snapshot(&mut self) -> Task<cosmic::Action<Message>> {
+        if self.snapshot_in_flight {
+            self.snapshot_rerequested = true;
+            return Task::none();
+        }
+        self.snapshot_in_flight = true;
+        snapshot_task().map(cosmic::Action::App)
     }
+
+    fn snapshot_finished(&mut self) -> Task<cosmic::Action<Message>> {
+        self.snapshot_in_flight = false;
+        if std::mem::take(&mut self.snapshot_rerequested) {
+            self.request_snapshot()
+        } else {
+            Task::none()
+        }
+    }
+}
+
+/// Run the nmrs call for a VPN activate/deactivate request; the resulting
+/// [`Message::VpnOperationFinished`] carries the request's generation.
+/// `connect_vpn_by_uuid` resolves once activation completes, fails, or times
+/// out, so for activations the message marks the exact end of the pending
+/// state; `disconnect_vpn_by_uuid` resolves as soon as the request is
+/// accepted (see the handling in [`Message::VpnOperationFinished`]).
+fn vpn_op_task(
+    uuid: Arc<str>,
+    action: PendingVpnAction,
+    generation: u64,
+) -> Task<cosmic::Action<Message>> {
+    cosmic::task::future(async move {
+        let error = match NmrsManager::new().await {
+            Ok(nm) => {
+                let (result, verb) = match action {
+                    PendingVpnAction::Activate => (nm.connect_vpn_by_uuid(&uuid).await, "activate"),
+                    PendingVpnAction::Deactivate => {
+                        (nm.disconnect_vpn_by_uuid(&uuid).await, "disconnect")
+                    }
+                };
+                result.err().map(|e| format!("{verb} VPN {uuid}: {e}"))
+            }
+            Err(e) => Some(format!("nmrs init: {e}")),
+        };
+        Message::VpnOperationFinished {
+            action,
+            error,
+            generation,
+        }
+    })
+    .map(cosmic::Action::App)
+}
+
+/// Deliver [`Message::PendingVpnTimeout`] after `bound`, bounding how long
+/// the request issued under `generation` may stay pending.
+fn pending_vpn_timeout_task(
+    uuid: Arc<str>,
+    generation: u64,
+    bound: std::time::Duration,
+) -> Task<cosmic::Action<Message>> {
+    cosmic::task::future(async move {
+        tokio::time::sleep(bound).await;
+        Message::PendingVpnTimeout { uuid, generation }
+    })
+    .map(cosmic::Action::App)
 }
 
 /// Registers an `nmrs` secret agent on the system bus and yields its
@@ -1062,9 +1222,18 @@ pub(crate) enum Message {
     ActivateVpn(Arc<str>),   // UUID of VPN to activate
     DeactivateVpn(Arc<str>), // UUID of VPN to deactivate
     VpnOperationFinished {
-        uuid: Arc<str>,
         action: PendingVpnAction,
         error: Option<String>,
+        /// The request's [`PendingVpn::generation`], so a stale completion
+        /// can't clear a newer request's pending state.
+        generation: u64,
+    },
+    /// A VPN operation's pending state outlived its bound; clear it so the
+    /// spinner can't get stuck if the operation never resolves. Generation-
+    /// guarded like [`Message::VpnOperationFinished`].
+    PendingVpnTimeout {
+        uuid: Arc<str>,
+        generation: u64,
     },
     ToggleVpnList, // Show/hide available VPNs
     /// An update from the secret agent
@@ -1090,6 +1259,8 @@ pub(crate) enum Message {
     PasswordUpdate(SecureString),
     /// Update applet state from NetworkManager.
     Snapshot(AppletSnapshot),
+    /// A snapshot refresh failed; ends the in-flight snapshot request.
+    SnapshotFailed(String),
     /// Toggle WiFi access
     WiFiEnable(bool),
     /// Refresh state
@@ -1109,12 +1280,15 @@ impl cosmic::Application for CosmicNetworkApplet {
     const APP_ID: &'static str = config::APP_ID;
 
     fn init(core: cosmic::app::Core, _flags: ()) -> (Self, app::Task<Message>) {
-        let applet = Self {
+        let mut applet = Self {
             core,
             icon_name: "network-wired-disconnected-symbolic".to_string(),
             token_tx: None,
             ..Default::default()
         };
+        // Route the first snapshot through the coalescer so the
+        // `snapshot_in_flight` bookkeeping lives in one place.
+        let first_snapshot = applet.request_snapshot();
 
         let uuid = uuid::Uuid::new_v4().to_string().replace("-", "_");
         let my_id =
@@ -1127,11 +1301,13 @@ impl cosmic::Application for CosmicNetworkApplet {
                 ..applet
             },
             Task::batch(vec![
-                snapshot_task(),
-                network_events_task(),
-                secret_agent_task(my_id, secret_agent_reregister_rx).map(Message::SecretAgent),
-            ])
-            .map(cosmic::Action::App),
+                first_snapshot,
+                Task::batch(vec![
+                    network_events_task(),
+                    secret_agent_task(my_id, secret_agent_reregister_rx).map(Message::SecretAgent),
+                ])
+                .map(cosmic::Action::App),
+            ]),
         )
     }
 
@@ -1151,7 +1327,7 @@ impl cosmic::Application for CosmicNetworkApplet {
                     return destroy_popup(p);
                 } else {
                     let mut tasks = Vec::with_capacity(2);
-                    tasks.push(snapshot_task().map(cosmic::Action::App));
+                    tasks.push(self.request_snapshot());
                     tasks.push(cosmic::surface::surface_task(
                         cosmic::surface::action::app_popup(
                             |_| Default::default(),
@@ -1329,58 +1505,75 @@ impl cosmic::Application for CosmicNetworkApplet {
                 ));
             }
             Message::ActivateVpn(uuid) => {
+                self.vpn_request_generation += 1;
+                let generation = self.vpn_request_generation;
                 self.nm_state.pending_vpn = Some(PendingVpn {
                     uuid: uuid.clone(),
                     action: PendingVpnAction::Activate,
+                    generation,
                 });
                 self.update_icon_name();
                 return Task::batch(vec![
-                    snapshot_task().map(cosmic::Action::App),
-                    self.connect_vpn(uuid.clone()),
+                    self.request_snapshot(),
+                    vpn_op_task(uuid.clone(), PendingVpnAction::Activate, generation),
+                    pending_vpn_timeout_task(uuid, generation, VPN_ACTIVATE_PENDING_BOUND),
                 ]);
             }
             Message::DeactivateVpn(uuid) => {
+                self.vpn_request_generation += 1;
+                let generation = self.vpn_request_generation;
                 self.nm_state.pending_vpn = Some(PendingVpn {
                     uuid: uuid.clone(),
                     action: PendingVpnAction::Deactivate,
+                    generation,
                 });
                 self.update_icon_name();
-                let disconnect_task = cosmic::task::future(async move {
-                    let error = match NmrsManager::new().await {
-                        Ok(nm) => nm
-                            .disconnect_vpn_by_uuid(&uuid)
-                            .await
-                            .err()
-                            .map(|e| format!("disconnect VPN {uuid}: {e}")),
-                        Err(e) => Some(format!("nmrs init: {e}")),
-                    };
-                    Message::VpnOperationFinished {
-                        uuid,
-                        action: PendingVpnAction::Deactivate,
-                        error,
-                    }
-                })
-                .map(cosmic::Action::App);
                 return Task::batch(vec![
-                    snapshot_task().map(cosmic::Action::App),
-                    disconnect_task,
+                    self.request_snapshot(),
+                    vpn_op_task(uuid.clone(), PendingVpnAction::Deactivate, generation),
+                    pending_vpn_timeout_task(uuid, generation, VPN_DEACTIVATE_PENDING_BOUND),
                 ]);
             }
             Message::VpnOperationFinished {
-                uuid,
                 action,
                 error,
+                generation,
             } => {
-                if self.nm_state.pending_vpn.as_ref().is_some_and(|pending| {
-                    pending.uuid.as_ref() == uuid.as_ref() && pending.action == action
-                }) {
+                // `disconnect_vpn_by_uuid` resolves as soon as deactivation is
+                // *requested*, not when it completes. Keep the pending state so
+                // the row shows a spinner instead of briefly flipping back to
+                // "connected"; `clear_completed_pending_vpn` ends it once a
+                // snapshot shows the VPN gone, bounded by the deactivation
+                // timeout armed when the request was issued.
+                if action == PendingVpnAction::Deactivate && error.is_none() {
+                    return self.request_snapshot();
+                }
+                if self
+                    .nm_state
+                    .pending_vpn
+                    .as_ref()
+                    .is_some_and(|pending| pending.generation == generation)
+                {
                     self.nm_state.pending_vpn = None;
                     self.update_icon_name();
                 }
                 if let Some(error) = error {
                     tracing::error!("{error}");
                 }
-                return snapshot_task().map(cosmic::Action::App);
+                return self.request_snapshot();
+            }
+            Message::PendingVpnTimeout { uuid, generation } => {
+                if self
+                    .nm_state
+                    .pending_vpn
+                    .as_ref()
+                    .is_some_and(|pending| pending.generation == generation)
+                {
+                    tracing::warn!("VPN {uuid} operation still pending at its timeout; clearing");
+                    self.nm_state.pending_vpn = None;
+                    self.update_icon_name();
+                    return self.request_snapshot();
+                }
             }
             Message::ToggleVpnList => {
                 self.show_available_vpns = !self.show_available_vpns;
@@ -1470,7 +1663,7 @@ impl cosmic::Application for CosmicNetworkApplet {
                     self.failed_known_ssids.insert(access_point.ssid.clone());
                     self.new_connection = Some(NewConnectionState::Failure(access_point));
                 }
-                return snapshot_task().map(cosmic::Action::App);
+                return self.request_snapshot();
             }
             Message::NetworkEvent(event) => {
                 if matches!(event, NetworkEvent::NetworkManagerRestarted) {
@@ -1484,7 +1677,7 @@ impl cosmic::Application for CosmicNetworkApplet {
                         }
                     }
                 }
-                return snapshot_task().map(cosmic::Action::App);
+                return self.request_snapshot();
             }
             Message::PasswordUpdate(entered_pw) => {
                 if let Some(NewConnectionState::EnterPassword { password, .. }) =
@@ -1495,6 +1688,11 @@ impl cosmic::Application for CosmicNetworkApplet {
             }
             Message::Snapshot(snapshot) => {
                 self.apply_snapshot(snapshot);
+                return self.snapshot_finished();
+            }
+            Message::SnapshotFailed(error) => {
+                tracing::error!("snapshot failed: {error}");
+                return self.snapshot_finished();
             }
             Message::WiFiEnable(enable) => {
                 self.nm_state.nm_state.wifi_enabled = enable;
@@ -1585,7 +1783,7 @@ impl cosmic::Application for CosmicNetworkApplet {
                 }
             },
             Message::Refresh => {
-                return snapshot_task().map(cosmic::Action::App);
+                return self.request_snapshot();
             }
             Message::ToggleVPNPasswordVisibility => {
                 if let Some(requested_vpn) = self.nm_state.requested_vpn.as_mut() {
